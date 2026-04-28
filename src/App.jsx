@@ -42,33 +42,45 @@ const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
 const norm = (e) => e.trim().toLowerCase();
 
 // ─── URL content extractor ────────────────────────────────────────────────────
+const isDriveUrl = (url) => url.includes("drive.google.com") || url.includes("docs.google.com");
+
 async function extractFromUrl(url) {
   const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
 
-  // Use a CORS proxy to fetch the URL content
+  // ── Google Drive / Docs / Sheets / Slides ──────────────────────────────────
+  if (isDriveUrl(url)) {
+    try {
+      const res = await fetch("/api/drive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.content) return data.content;
+      }
+    } catch {}
+    // Fallback si falla
+    return `📎 Recurso de Google Drive\n🔗 ${url}\n\n[No se pudo leer el contenido. Asegúrate de que el archivo esté compartido con tgp-rrhh-agent@tgp-rrhh-agent.iam.gserviceaccount.com]`;
+  }
+
+  // ── Otras URLs públicas ────────────────────────────────────────────────────
   const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
   let htmlContent = "";
-
   try {
     const res = await fetch(proxyUrl);
     const data = await res.json();
     htmlContent = data.contents || "";
-  } catch {
-    htmlContent = "";
-  }
+  } catch { htmlContent = ""; }
 
-  // Use Claude to extract clean text from HTML or summarize the URL
   const prompt = htmlContent
-    ? `Aquí está el contenido HTML de la URL ${url}:\n\n${htmlContent.substring(0, 15000)}\n\nExtrae el texto relevante de este contenido de forma organizada. Elimina HTML, scripts y estilos. Devuelve solo el contenido útil en texto plano.`
-    : `No se pudo acceder directamente a la URL: ${url}\n\nEsta es una URL que puede requerir autenticación (como Google Drive). Por favor indica que el contenido fue registrado como referencia y muestra la URL para que los usuarios puedan acceder directamente. Formato: "📎 Recurso externo: [título inferido de la URL]\n🔗 ${url}\n\n[Descripción breve de qué tipo de recurso podría ser basándote en la URL]"`;
+    ? `Aquí está el contenido HTML de la URL ${url}:\n\n${htmlContent.substring(0, 15000)}\n\nExtrae el texto relevante de forma organizada. Elimina HTML, scripts y estilos. Devuelve solo el contenido útil en texto plano.`
+    : `No se pudo acceder a la URL: ${url}. Indica que fue registrado como referencia con formato: "📎 Recurso externo\n🔗 ${url}"`;
 
   const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 3000,
-      messages: [{ role: "user", content: prompt }]
-    })
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 3000, messages: [{ role: "user", content: prompt }] })
   });
   const claudeData = await claudeRes.json();
   return claudeData.content?.[0]?.text || `📎 Recurso: ${url}`;
