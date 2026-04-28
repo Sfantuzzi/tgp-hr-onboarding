@@ -155,22 +155,33 @@ async function extractDocx(file) {
 }
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
+// ─── Render message with clickable links ─────────────────────────────────────
+function renderMessage(text) {
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const parts = text.split(urlRegex);
+  return parts.map((part, i) => {
+    if (/^https?:\/\//.test(part)) {
+      return <a key={i} href={part} target="_blank" rel="noopener noreferrer" style={{ color: "#D4AF37", textDecoration: "underline", wordBreak: "break-all" }}>{part}</a>;
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
+
 async function askClaude(question, knowledge, history) {
   const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
-  const kb = knowledge.map((e, i) => `[${i+1}] ${e.title}\nCategoría: ${e.category}\n${e.content}`).join("\n\n---\n\n");
-  const system = `Eres el Agente de RRHH de TGP. Tienes acceso a la documentación oficial de onboarding y procesos internos.
-Tu misión es ayudar a los SDRs a resolver sus dudas de forma clara y profesional.
+  const kb = knowledge.map((e, i) => `[${i+1}] ${e.title}\nCategoría: ${e.category}${e.comentario ? "\nUtilidad: " + e.comentario : ""}\n${e.content}`).join("\n\n---\n\n");
+  const system = `Eres el Agente de RRHH de TGP. Respondes preguntas sobre onboarding y procesos internos.
 
 BASE DE CONOCIMIENTO:
 ${kb || "⚠️ Aún no hay documentación cargada."}
 
-INSTRUCCIONES:
-- Responde siempre en español
-- Usa únicamente la información de la base de conocimiento
-- Si hay links en la base de conocimiento, compártelos cuando sean relevantes
-- Si no tienes la respuesta, recomienda contactar a RRHH de TGP
-- Usa listas cuando ayude a la claridad
-- Tono profesional, directo y cercano`;
+REGLAS ESTRICTAS:
+- Responde en español
+- Máximo 4 líneas — sé directo y conciso
+- Si hay URLs en la info, inclúyelas tal cual (el sistema las hace clickeables)
+- Sin introducciones largas ni despedidas
+- Si no tienes la info: "No tengo esa información. Contacta a RRHH de TGP."
+- Tono cercano y profesional`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -349,6 +360,8 @@ export default function App() {
   const [urlInput, setUrlInput]       = useState("");
   const [urlTitle, setUrlTitle]       = useState("");
   const [urlCategory, setUrlCategory] = useState("Onboarding");
+  const [fileComentario, setFileComentario] = useState("");
+  const [urlComentario, setUrlComentario]   = useState("");
   const [urlLoading, setUrlLoading]   = useState(false);
   const [urlStatus, setUrlStatus]     = useState("");
 
@@ -431,7 +444,7 @@ export default function App() {
       if (!content.trim()) { setFileStatus("⚠️ No se pudo extraer texto. Intenta con PDF."); setFileUploading(false); return; }
       const title = file.name.replace(/\.[^/.]+$/, "");
       setFileStatus(`✅ Guardando "${title}"...`);
-      const rows = await db.addKnowledge({ title, category: "Onboarding", content: content.trim() });
+      const rows = await db.addKnowledge({ title, category: "Onboarding", content: content.trim(), comentario: fileComentario.trim() });
       setKnowledge(prev => [...prev, rows[0]]);
       setFileStatus(`✅ "${title}" guardado`);
       setTimeout(() => setFileStatus(""), 3000);
@@ -451,9 +464,9 @@ export default function App() {
       const content = await extractFromUrl(url);
       const title = urlTitle.trim() || url.replace(/^https?:\/\//, "").split("/")[0];
       setUrlStatus(`✅ Guardando "${title}"...`);
-      const rows = await db.addKnowledge({ title, category: urlCategory, content });
+      const rows = await db.addKnowledge({ title, category: urlCategory, content, comentario: urlComentario.trim() });
       setKnowledge(prev => [...prev, rows[0]]);
-      setUrlInput(""); setUrlTitle(""); setUrlCategory("Onboarding");
+      setUrlInput(""); setUrlTitle(""); setUrlCategory("Onboarding"); setUrlComentario("");
       setUrlStatus(`✅ "${title}" guardado correctamente`);
       setTimeout(() => setUrlStatus(""), 3000);
     } catch (e) { setUrlStatus(`❌ Error: ${e.message}`); }
@@ -534,7 +547,7 @@ export default function App() {
                 </div>
                 <div style={{ maxWidth: "78%", background: msg.role === "user" ? "#161616" : "#111", border: `1px solid ${msg.role === "user" ? "#2a2a2a" : "#1e1e1e"}`, borderRadius: msg.role === "user" ? "12px 2px 12px 12px" : "2px 12px 12px 12px", padding: "12px 16px", fontSize: 13.5, lineHeight: 1.7, color: msg.role === "user" ? "#ccc" : "#ddd", whiteSpace: "pre-wrap" }}>
                   {msg.role === "assistant" && <div style={{ fontSize: 10, fontWeight: 700, color: "#D4AF37", letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 8, opacity: 0.7 }}>⭐ Agente TGP</div>}
-                  {msg.content}
+                  {msg.role === "assistant" ? renderMessage(msg.content) : msg.content}
                 </div>
               </div>
             ))}
@@ -601,6 +614,11 @@ export default function App() {
               <div style={{ color: "#333", fontSize: 11, marginTop: 5 }}>PDF · Word · Excel · CSV · PowerPoint</div>
             </div>
             <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.txt,.pptx,.ppt" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
+            <div style={{ marginTop: 12 }}>
+              <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Comentario / Utilidad (opcional)</div>
+              <input value={fileComentario} onChange={e => setFileComentario(e.target.value)}
+                placeholder="Ej: Manual de bienvenida para nuevos SDRs" style={S.inp(false)} disabled={fileUploading} />
+            </div>
             {fileStatus && (
               <div style={{ marginTop: 10, padding: "10px 14px", background: "#0a0a0a", borderRadius: 7, fontSize: 13, color: fileStatus.startsWith("❌") ? "#e53e3e" : fileStatus.startsWith("✅") ? "#34c78a" : "#D4AF37", border: "1px solid #1e1e1e" }}>
                 {fileStatus}
@@ -626,6 +644,10 @@ export default function App() {
               <div>
                 <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Título (opcional)</div>
                 <input value={urlTitle} onChange={e => setUrlTitle(e.target.value)} placeholder="Ej: Manual de bienvenida en Drive" style={S.inp(false)} />
+              </div>
+              <div>
+                <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Comentario / Utilidad (opcional)</div>
+                <input value={urlComentario} onChange={e => setUrlComentario(e.target.value)} placeholder="Ej: Política de vacaciones para el equipo comercial" style={S.inp(false)} />
               </div>
               <div>
                 <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Categoría</div>
