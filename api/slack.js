@@ -2,8 +2,11 @@
 
 const SUPABASE_URL = "https://tvattznxqmpdplgydgnb.supabase.co";
 
+// Cache simple para evitar procesar el mismo evento dos veces
+const processedEvents = new Set();
+
 async function getKnowledge() {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/knowledge?order=id.asc`, {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/knowledge?order=id.asc&select=title,category,content`, {
     headers: {
       "apikey": process.env.SUPABASE_KEY,
       "Authorization": `Bearer ${process.env.SUPABASE_KEY}`,
@@ -14,23 +17,13 @@ async function getKnowledge() {
 }
 
 async function askClaude(question, knowledge) {
-  const kb = knowledge.map((e, i) =>
-    `[${i+1}] ${e.title}\nCategoría: ${e.category}\n${e.content}`
-  ).join("\n\n---\n\n");
+  const kb = knowledge.length > 0
+    ? knowledge.map((e, i) => `[${i+1}] ${e.title}\n${e.content}`).join("\n\n---\n\n")
+    : "No hay documentación cargada aún.";
 
-  const system = `Eres el Agente de RRHH de TGP. Tienes acceso a la documentación oficial de onboarding y procesos internos.
-Tu misión es ayudar a los SDRs a resolver sus dudas de forma clara y profesional.
-
-BASE DE CONOCIMIENTO:
-${kb || "Aún no hay documentación cargada. Contacta a RRHH de TGP."}
-
-INSTRUCCIONES:
-- Responde siempre en español
-- Usa únicamente la información de la base de conocimiento
-- Si no tienes la respuesta, recomienda contactar a RRHH de TGP
-- Respuestas concisas — estás en Slack
-- Usa listas cuando ayude a la claridad
-- Tono profesional, directo y cercano`;
+  const system = `Eres el Agente de RRHH de TGP. Responde dudas sobre onboarding y procesos internos.
+BASE DE CONOCIMIENTO: ${kb}
+REGLAS: Responde en español, sé conciso (máx 3 párrafos), usa la info disponible, tono profesional y cercano.`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -40,8 +33,8 @@ INSTRUCCIONES:
       "anthropic-version": "2023-06-01"
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 800,
+      model: "claude-haiku-4-5-20251001", // Modelo más rápido
+      max_tokens: 500,
       system,
       messages: [{ role: "user", content: question }]
     })
@@ -67,14 +60,23 @@ export default async function handler(req, res) {
 
   const body = req.body;
 
-  // 1. Slack URL verification challenge — responder inmediatamente sin verificar firma
+  // Slack URL verification
   if (body.type === "url_verification") {
     return res.status(200).json({ challenge: body.challenge });
   }
 
-  // 2. Procesar eventos de mensajes
+  // Eventos de mensajes
   if (body.type === "event_callback") {
     const event = body.event;
+    const eventId = body.event_id;
+
+    // Evitar procesar el mismo evento dos veces (Slack reintenta si no responde rápido)
+    if (processedEvents.has(eventId)) {
+      return res.status(200).json({ ok: true });
+    }
+    processedEvents.add(eventId);
+    // Limpiar cache después de 1 minuto
+    setTimeout(() => processedEvents.delete(eventId), 60000);
 
     // Solo DMs que no sean del bot
     if (
@@ -83,22 +85,29 @@ export default async function handler(req, res) {
       !event.bot_id &&
       !event.subtype
     ) {
-      // Responder 200 inmediatamente para evitar timeout de Slack
+      // Responder 200 inmediatamente
       res.status(200).json({ ok: true });
 
-      // Procesar en background
       try {
         const question = event.text?.trim();
         if (!question) return;
 
-        await sendSlackMessage(event.channel, "⏳ Consultando la base de conocimiento de TGP...");
+        // Obtener knowledge y preguntar a Claude en paralelo con timeout
+        const [knowledge] = await Promise.all([
+          getKnowledge()
+        ]);
 
-        const knowledge = await getKnowledge();
-        const answer = await askClaude(question, knowledge);
+        const answer = await Promise.race([
+          askClaude(question, knowledge),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000))
+        ]);
 
         await sendSlackMessage(event.channel, `*Agente RRHH TGP* 🤖\n\n${answer}`);
       } catch (e) {
-        await sendSlackMessage(event?.channel, `❌ Error: ${e.message}`);
+        const msg = e.message === "timeout"
+          ? "⏱️ La consulta tardó demasiado. Intenta de nuevo con una pregunta más específica."
+          : `❌ Error: ${e.message}`;
+        await sendSlackMessage(event?.channel, msg);
       }
       return;
     }
