@@ -1,4 +1,4 @@
-// api/drive.js — Google Drive reader usando Node.js crypto nativo
+// api/drive.js — Google Drive reader, exports as PDF then extracts text via Claude
 
 import { createSign } from 'crypto';
 
@@ -10,9 +10,9 @@ function extractFileId(url) {
     /\/presentation\/d\/([a-zA-Z0-9_-]+)/,
     /id=([a-zA-Z0-9_-]+)/
   ];
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match) return match[1];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
   }
   return null;
 }
@@ -20,70 +20,54 @@ function extractFileId(url) {
 async function getAccessToken() {
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-
   const now = Math.floor(Date.now() / 1000);
+
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString('base64url');
   const claim  = Buffer.from(JSON.stringify({
     iss: email,
     scope: "https://www.googleapis.com/auth/drive.readonly",
     aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now
+    exp: now + 3600, iat: now
   })).toString('base64url');
 
   const signingInput = `${header}.${claim}`;
   const sign = createSign('RSA-SHA256');
   sign.update(signingInput);
-  const sig = sign.sign(privateKey, 'base64url');
-  const jwt = `${signingInput}.${sig}`;
+  const jwt = `${signingInput}.${sign.sign(privateKey, 'base64url')}`;
 
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   });
-
   const data = await res.json();
-  if (data.error) throw new Error(`Auth error: ${data.error_description || data.error}`);
+  if (data.error) throw new Error(`Auth: ${data.error_description || data.error}`);
   return data.access_token;
 }
 
-async function readFile(fileId, token) {
-  // Get metadata
-  const metaRes = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,mimeType`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  const meta = await metaRes.json();
-
-  if (meta.error) throw new Error(`Drive error: ${meta.error.message}`);
-
-  const { name, mimeType } = meta;
-  let content = "";
-
-  if (mimeType === "application/vnd.google-apps.document") {
-    const r = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    content = await r.text();
-  } else if (mimeType === "application/vnd.google-apps.spreadsheet") {
-    const r = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/csv`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    content = await r.text();
-  } else if (mimeType === "application/vnd.google-apps.presentation") {
-    const r = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    content = await r.text();
-  } else {
-    content = `[Archivo: ${name} — Tipo: ${mimeType}. Para mejor extracción, usa Google Docs.]`;
-  }
-
-  return { name, content: content.substring(0, 20000) };
+async function extractTextWithClaude(pdfBase64, fileName) {
+  const apiKey = process.env.VITE_ANTHROPIC_API_KEY;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4000,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfBase64 } },
+          { type: "text", text: "Extrae todo el texto de este documento de forma ordenada. Incluye todos los títulos, párrafos, tablas y listas. Solo el texto, sin comentarios adicionales." }
+        ]
+      }]
+    })
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text || "";
 }
 
 export default async function handler(req, res) {
@@ -97,13 +81,42 @@ export default async function handler(req, res) {
 
   try {
     const token = await getAccessToken();
-    const { name, content } = await readFile(fileId, token);
 
-    if (!content || content.trim().length < 10) {
-      return res.status(200).json({
-        name,
-        content: `[Archivo "${name}" no tiene contenido legible. Asegúrate de que esté compartido con tgp-rrhh-agent@tgp-rrhh-agent.iam.gserviceaccount.com]`
-      });
+    // Get metadata
+    const metaRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,mimeType`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const meta = await metaRes.json();
+    if (meta.error) throw new Error(`Drive: ${meta.error.message}`);
+
+    const { name, mimeType } = meta;
+    let pdfBuffer;
+
+    // Export Google Docs/Sheets/Slides as PDF
+    if (mimeType.includes("google-apps")) {
+      const exportRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/pdf`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!exportRes.ok) throw new Error(`Export failed: ${exportRes.status}`);
+      pdfBuffer = await exportRes.arrayBuffer();
+    } else {
+      // Download file directly (PDF, DOCX, etc)
+      const fileRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!fileRes.ok) throw new Error(`Download failed: ${fileRes.status}`);
+      pdfBuffer = await fileRes.arrayBuffer();
+    }
+
+    // Convert to base64 and extract text with Claude
+    const base64 = Buffer.from(pdfBuffer).toString('base64');
+    const content = await extractTextWithClaude(base64, name);
+
+    if (!content || content.trim().length < 20) {
+      throw new Error("No se pudo extraer contenido del archivo");
     }
 
     return res.status(200).json({ name, content });
