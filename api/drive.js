@@ -1,57 +1,6 @@
-// api/drive.js — Vercel Serverless Function para leer archivos de Google Drive
+// api/drive.js — Google Drive reader usando Node.js crypto nativo
 
-async function getGoogleAccessToken() {
-  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-
-  const header = { alg: "RS256", typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const claim = {
-    iss: email,
-    scope: "https://www.googleapis.com/auth/drive.readonly",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now
-  };
-
-  const encode = (obj) => btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const headerB64 = encode(header);
-  const claimB64 = encode(claim);
-  const signingInput = `${headerB64}.${claimB64}`;
-
-  // Import private key and sign
-  const keyData = privateKey
-    .replace('-----BEGIN PRIVATE KEY-----', '')
-    .replace('-----END PRIVATE KEY-----', '')
-    .replace(/\s/g, '');
-  
-  const binaryKey = Uint8Array.from(atob(keyData), c => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8", binaryKey,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false, ["sign"]
-  );
-
-  const encoder = new TextEncoder();
-  const signature = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5", cryptoKey, encoder.encode(signingInput)
-  );
-
-  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-
-  const jwt = `${signingInput}.${sigB64}`;
-
-  // Exchange JWT for access token
-  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
-  });
-
-  const tokenData = await tokenRes.json();
-  return tokenData.access_token;
-}
+import { createSign } from 'crypto';
 
 function extractFileId(url) {
   const patterns = [
@@ -68,47 +17,73 @@ function extractFileId(url) {
   return null;
 }
 
-async function readDriveFile(fileId, accessToken) {
-  // Get file metadata first
-  const metaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,mimeType`, {
-    headers: { "Authorization": `Bearer ${accessToken}` }
-  });
-  const meta = await metaRes.json();
-  const { name, mimeType } = meta;
+async function getAccessToken() {
+  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString('base64url');
+  const claim  = Buffer.from(JSON.stringify({
+    iss: email,
+    scope: "https://www.googleapis.com/auth/drive.readonly",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now
+  })).toString('base64url');
+
+  const signingInput = `${header}.${claim}`;
+  const sign = createSign('RSA-SHA256');
+  sign.update(signingInput);
+  const sig = sign.sign(privateKey, 'base64url');
+  const jwt = `${signingInput}.${sig}`;
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(`Auth error: ${data.error_description || data.error}`);
+  return data.access_token;
+}
+
+async function readFile(fileId, token) {
+  // Get metadata
+  const metaRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,mimeType`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const meta = await metaRes.json();
+
+  if (meta.error) throw new Error(`Drive error: ${meta.error.message}`);
+
+  const { name, mimeType } = meta;
   let content = "";
 
-  // Google Docs → export as text
   if (mimeType === "application/vnd.google-apps.document") {
-    const exportRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    content = await exportRes.text();
-  }
-  // Google Sheets → export as CSV
-  else if (mimeType === "application/vnd.google-apps.spreadsheet") {
-    const exportRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/csv`, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    content = await exportRes.text();
-  }
-  // Google Slides → export as text
-  else if (mimeType === "application/vnd.google-apps.presentation") {
-    const exportRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    content = await exportRes.text();
-  }
-  // PDF, DOCX, etc → download directly
-  else {
-    const fileRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    // For binary files, return placeholder
-    content = `[Archivo: ${name} — tipo: ${mimeType}. Para mejor extracción, convierte a Google Docs.]`;
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    content = await r.text();
+  } else if (mimeType === "application/vnd.google-apps.spreadsheet") {
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/csv`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    content = await r.text();
+  } else if (mimeType === "application/vnd.google-apps.presentation") {
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    content = await r.text();
+  } else {
+    content = `[Archivo: ${name} — Tipo: ${mimeType}. Para mejor extracción, usa Google Docs.]`;
   }
 
-  return { name, content: content.substring(0, 15000) }; // Limit content size
+  return { name, content: content.substring(0, 20000) };
 }
 
 export default async function handler(req, res) {
@@ -118,13 +93,22 @@ export default async function handler(req, res) {
   if (!url) return res.status(400).json({ error: "URL requerida" });
 
   const fileId = extractFileId(url);
-  if (!fileId) return res.status(400).json({ error: "No se pudo extraer el ID del archivo de Drive" });
+  if (!fileId) return res.status(400).json({ error: "No se pudo extraer el ID del archivo" });
 
   try {
-    const accessToken = await getGoogleAccessToken();
-    const { name, content } = await readDriveFile(fileId, accessToken);
+    const token = await getAccessToken();
+    const { name, content } = await readFile(fileId, token);
+
+    if (!content || content.trim().length < 10) {
+      return res.status(200).json({
+        name,
+        content: `[Archivo "${name}" no tiene contenido legible. Asegúrate de que esté compartido con tgp-rrhh-agent@tgp-rrhh-agent.iam.gserviceaccount.com]`
+      });
+    }
+
     return res.status(200).json({ name, content });
   } catch (e) {
+    console.error("Drive error:", e.message);
     return res.status(500).json({ error: e.message });
   }
 }
