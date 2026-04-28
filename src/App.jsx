@@ -170,18 +170,20 @@ function renderMessage(text) {
 async function askClaude(question, knowledge, history) {
   const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
   const kb = knowledge.map((e, i) => `[${i+1}] ${e.title}\nCategoría: ${e.category}${e.comentario ? "\nUtilidad: " + e.comentario : ""}\n${e.content}`).join("\n\n---\n\n");
-  const system = `Eres el Agente de RRHH de TGP. Respondes preguntas sobre onboarding y procesos internos.
+  const system = `Eres el Agente de RRHH de TGP. Tu trabajo es responder preguntas usando la información de la base de conocimiento.
 
 BASE DE CONOCIMIENTO:
 ${kb || "⚠️ Aún no hay documentación cargada."}
 
-REGLAS ESTRICTAS:
-- Responde en español
-- Máximo 4 líneas — sé directo y conciso
-- Si hay URLs en la info, inclúyelas tal cual (el sistema las hace clickeables)
-- Sin introducciones largas ni despedidas
-- Si no tienes la info: "No tengo esa información. Contacta a RRHH de TGP."
-- Tono cercano y profesional`;
+REGLAS:
+- Responde SIEMPRE en español
+- Da la respuesta DIRECTAMENTE con la información — nunca digas "puedes ver el archivo" ni "te redirijo al documento"
+- Si la info está en la base de conocimiento, EXTRÁELA y EXPLÍCALA aquí mismo
+- Sé claro y preciso — ni muy corto ni muy largo, lo justo para responder bien
+- Si hay pasos o procesos, enuméralos
+- Solo al final, si hay un link relevante, agrégalo como referencia adicional
+- Si no tienes la información: "No tengo esa información. Contacta a RRHH de TGP."
+- Sin saludos innecesarios ni relleno`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
