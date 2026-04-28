@@ -119,7 +119,7 @@ async function extractDocx(file) {
 async function askClaude(question, knowledge, history) {
   const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
   const kb = knowledge.map((e, i) => `[${i+1}] ${e.title}\nCategoría: ${e.category}\n${e.content}`).join("\n\n---\n\n");
-  const system = `Eres el Agente de RRHH de TGP (The Growth Partners). Tienes acceso a la documentación oficial de onboarding y procesos internos.
+  const system = `Eres el Agente de RRHH de TGP. Tienes acceso a la documentación oficial de onboarding y procesos internos.
 Tu misión es ayudar a los SDRs a resolver sus dudas de forma clara y profesional.
 
 BASE DE CONOCIMIENTO:
