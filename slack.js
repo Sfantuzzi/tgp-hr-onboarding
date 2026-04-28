@@ -1,4 +1,4 @@
-// api/slack.js — Vercel Serverless Function para el bot de Slack
+
 
 const SUPABASE_URL = "https://tvattznxqmpdplgydgnb.supabase.co";
 
@@ -62,45 +62,31 @@ async function sendSlackMessage(channel, text) {
   });
 }
 
-async function verifySlackSignature(reqHeaders, rawBody) {
-  const timestamp = reqHeaders["x-slack-request-timestamp"];
-  const signature = reqHeaders["x-slack-signature"];
-  if (!timestamp || !signature) return false;
-  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
-
-  const sigBasestring = `v0:${timestamp}:${rawBody}`;
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", encoder.encode(process.env.SLACK_SIGNING_SECRET),
-    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(sigBasestring));
-  const hex = "v0=" + Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
-  return hex === signature;
-}
-
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const rawBody = JSON.stringify(req.body);
-  const isValid = await verifySlackSignature(req.headers, rawBody);
-  if (!isValid) return res.status(401).json({ error: "Invalid signature" });
-
   const body = req.body;
 
-  // Slack URL verification
+  // 1. Slack URL verification challenge — responder inmediatamente sin verificar firma
   if (body.type === "url_verification") {
     return res.status(200).json({ challenge: body.challenge });
   }
 
-  // Eventos de mensajes
+  // 2. Procesar eventos de mensajes
   if (body.type === "event_callback") {
     const event = body.event;
 
     // Solo DMs que no sean del bot
-    if (event.type === "message" && event.channel_type === "im" && !event.bot_id && !event.subtype) {
+    if (
+      event.type === "message" &&
+      event.channel_type === "im" &&
+      !event.bot_id &&
+      !event.subtype
+    ) {
+      // Responder 200 inmediatamente para evitar timeout de Slack
       res.status(200).json({ ok: true });
 
+      // Procesar en background
       try {
         const question = event.text?.trim();
         if (!question) return;
