@@ -38,7 +38,7 @@ const db = {
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const SUPER_PIN = "tgp-super-2024";
+const SUPER_PIN = "TGPRRHH";
 const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
 const norm = (e) => e.trim().toLowerCase();
 
