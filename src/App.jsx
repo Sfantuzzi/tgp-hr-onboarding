@@ -29,7 +29,6 @@ const db = {
   deleteKnowledge: (id) => sb(`knowledge?id=eq.${id}`, { method: "DELETE", prefer: "return=minimal" }),
   getEmails: () => sb("emails?order=id.asc"),
   addEmail: (data) => sb("emails", { method: "POST", body: JSON.stringify(data) }),
-  updateEmail: (id, data) => sb(`emails?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(data), prefer: "return=representation" }),
   deleteEmail: (id) => sb(`emails?id=eq.${id}`, { method: "DELETE", prefer: "return=minimal" }),
   loginAdmin: async (email, password) => {
     const rows = await sb(`emails?email=eq.${encodeURIComponent(email.toLowerCase())}&password=eq.${encodeURIComponent(password)}`);
@@ -38,9 +37,42 @@ const db = {
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const SUPER_PIN = "TGPRRHH";
+const SUPER_PIN = "tgp-super-2024";
 const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
 const norm = (e) => e.trim().toLowerCase();
+
+// ─── URL content extractor ────────────────────────────────────────────────────
+async function extractFromUrl(url) {
+  const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
+
+  // Use a CORS proxy to fetch the URL content
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+  let htmlContent = "";
+
+  try {
+    const res = await fetch(proxyUrl);
+    const data = await res.json();
+    htmlContent = data.contents || "";
+  } catch {
+    htmlContent = "";
+  }
+
+  // Use Claude to extract clean text from HTML or summarize the URL
+  const prompt = htmlContent
+    ? `Aquí está el contenido HTML de la URL ${url}:\n\n${htmlContent.substring(0, 15000)}\n\nExtrae el texto relevante de este contenido de forma organizada. Elimina HTML, scripts y estilos. Devuelve solo el contenido útil en texto plano.`
+    : `No se pudo acceder directamente a la URL: ${url}\n\nEsta es una URL que puede requerir autenticación (como Google Drive). Por favor indica que el contenido fue registrado como referencia y muestra la URL para que los usuarios puedan acceder directamente. Formato: "📎 Recurso externo: [título inferido de la URL]\n🔗 ${url}\n\n[Descripción breve de qué tipo de recurso podría ser basándote en la URL]"`;
+
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514", max_tokens: 3000,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const claudeData = await claudeRes.json();
+  return claudeData.content?.[0]?.text || `📎 Recurso: ${url}`;
+}
 
 // ─── File extraction ──────────────────────────────────────────────────────────
 async function extractTextFromFile(file) {
@@ -72,7 +104,7 @@ async function extractPdf(file) {
       model: "claude-sonnet-4-20250514", max_tokens: 4000,
       messages: [{ role: "user", content: [
         { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
-        { type: "text", text: "Extrae todo el texto de este documento de forma ordenada. Incluye todos los títulos, párrafos, tablas y listas. Solo el texto, sin comentarios adicionales." }
+        { type: "text", text: "Extrae todo el texto de este documento de forma ordenada. Solo el texto, sin comentarios." }
       ]}]
     })
   });
@@ -85,17 +117,13 @@ async function extractExcel(file) {
     await new Promise((res, rej) => {
       const s = document.createElement("script");
       s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-      s.onload = res; s.onerror = rej;
-      document.head.appendChild(s);
+      s.onload = res; s.onerror = rej; document.head.appendChild(s);
     });
   }
   const buf = await file.arrayBuffer();
   const wb = window.XLSX.read(buf, { type: "array" });
   let text = "";
-  wb.SheetNames.forEach(name => {
-    text += `\n=== Hoja: ${name} ===\n`;
-    text += window.XLSX.utils.sheet_to_csv(wb.Sheets[name]);
-  });
+  wb.SheetNames.forEach(name => { text += `\n=== Hoja: ${name} ===\n`; text += window.XLSX.utils.sheet_to_csv(wb.Sheets[name]); });
   return text.trim();
 }
 
@@ -105,8 +133,7 @@ async function extractDocx(file) {
       await new Promise((res, rej) => {
         const s = document.createElement("script");
         s.src = "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js";
-        s.onload = res; s.onerror = rej;
-        document.head.appendChild(s);
+        s.onload = res; s.onerror = rej; document.head.appendChild(s);
       });
     }
     const buf = await file.arrayBuffer();
@@ -128,6 +155,7 @@ ${kb || "⚠️ Aún no hay documentación cargada."}
 INSTRUCCIONES:
 - Responde siempre en español
 - Usa únicamente la información de la base de conocimiento
+- Si hay links en la base de conocimiento, compártelos cuando sean relevantes
 - Si no tienes la respuesta, recomienda contactar a RRHH de TGP
 - Usa listas cuando ayude a la claridad
 - Tono profesional, directo y cercano`;
@@ -166,7 +194,7 @@ const Spinner = () => (
   </div>
 );
 
-// ─── Admin Login (correo + contraseña) ───────────────────────────────────────
+// ─── Admin Login ──────────────────────────────────────────────────────────────
 function AdminLogin({ onSuccess }) {
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
@@ -177,8 +205,8 @@ function AdminLogin({ onSuccess }) {
   async function submit(e) {
     e.preventDefault();
     const n = norm(email);
-    if (!isValidEmail(n))     { setErr("Ingresa un correo válido"); return; }
-    if (!password.trim())     { setErr("Ingresa tu contraseña"); return; }
+    if (!isValidEmail(n)) { setErr("Ingresa un correo válido"); return; }
+    if (!password.trim()) { setErr("Ingresa tu contraseña"); return; }
     setLoading(true); setErr("");
     try {
       const found = await db.loginAdmin(n, password.trim());
@@ -192,27 +220,22 @@ function AdminLogin({ onSuccess }) {
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, minHeight: "70vh", padding: 24 }}>
       <img src={TGP_LOGO} alt="TGP" style={{ height: 40, marginBottom: 28, opacity: 0.85 }} />
       <div style={{ fontSize: 18, fontWeight: 700, color: "#fff", marginBottom: 6 }}>Acceso Admin</div>
-      <div style={{ color: "#555", fontSize: 13, marginBottom: 28, textAlign: "center", maxWidth: 320, lineHeight: 1.6 }}>
-        Ingresa tus credenciales para acceder al panel de administración
-      </div>
+      <div style={{ color: "#555", fontSize: 13, marginBottom: 28, textAlign: "center", maxWidth: 320, lineHeight: 1.6 }}>Ingresa tus credenciales para acceder al panel de administración</div>
       <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 320 }}>
         <div>
           <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Correo electrónico</div>
-          <input type="email" value={email} onChange={e => { setEmail(e.target.value); setErr(""); }}
-            placeholder="tu@tgp.com" style={S.inp(!!err)} autoFocus />
+          <input type="email" value={email} onChange={e => { setEmail(e.target.value); setErr(""); }} placeholder="tu@tgp.com" style={S.inp(!!err)} autoFocus />
         </div>
         <div>
           <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Contraseña</div>
           <div style={{ position: "relative" }}>
-            <input type={showPass ? "text" : "password"} value={password} onChange={e => { setPassword(e.target.value); setErr(""); }}
-              placeholder="Tu contraseña" style={{ ...S.inp(!!err), paddingRight: 40 }} />
-            <button type="button" onClick={() => setShowPass(!showPass)}
-              style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: "#444", cursor: "pointer", fontSize: 14 }}>
+            <input type={showPass ? "text" : "password"} value={password} onChange={e => { setPassword(e.target.value); setErr(""); }} placeholder="Tu contraseña" style={{ ...S.inp(!!err), paddingRight: 40 }} />
+            <button type="button" onClick={() => setShowPass(!showPass)} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: "#444", cursor: "pointer", fontSize: 14 }}>
               {showPass ? "🙈" : "👁️"}
             </button>
           </div>
         </div>
-        {err && <div style={{ color: "#e53e3e", fontSize: 12, textAlign: "center", lineHeight: 1.5 }}>{err}</div>}
+        {err && <div style={{ color: "#e53e3e", fontSize: 12, textAlign: "center" }}>{err}</div>}
         <button type="submit" disabled={loading} style={{ ...S.btn(true), padding: "12px 0", width: "100%", marginTop: 4, fontSize: 14 }}>
           {loading ? "Verificando..." : "Ingresar"}
         </button>
@@ -242,8 +265,7 @@ function SuperPinGate({ children }) {
       <div style={{ fontSize: 18, fontWeight: 700, color: "#fff", marginBottom: 6 }}>Superadmin · Gestión de Accesos</div>
       <div style={{ color: "#555", fontSize: 13, marginBottom: 28, textAlign: "center", maxWidth: 300, lineHeight: 1.6 }}>PIN maestro para gestionar los accesos al panel Admin</div>
       <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
-        <input type="password" value={pin} onChange={e => setPin(e.target.value)} placeholder="PIN maestro"
-          style={{ ...S.inp(err), width: 220, textAlign: "center", letterSpacing: 4, fontSize: 15 }} autoFocus />
+        <input type="password" value={pin} onChange={e => setPin(e.target.value)} placeholder="PIN maestro" style={{ ...S.inp(err), width: 220, textAlign: "center", letterSpacing: 4, fontSize: 15 }} autoFocus />
         {err && <div style={{ color: "#e53e3e", fontSize: 12 }}>PIN incorrecto</div>}
         <button type="submit" style={{ ...S.btn(true), padding: "11px 36px", marginTop: 4 }}>Ingresar</button>
       </form>
@@ -251,16 +273,14 @@ function SuperPinGate({ children }) {
   );
 }
 
-// ─── EditModal (documentos) ───────────────────────────────────────────────────
+// ─── EditModal ────────────────────────────────────────────────────────────────
 function EditModal({ doc, categories, onSave, onClose }) {
-  const [form, setForm]   = useState({ title: doc.title, category: doc.category, content: doc.content });
+  const [form, setForm]     = useState({ title: doc.title, category: doc.category, content: doc.content });
   const [saving, setSaving] = useState(false);
 
   async function handleSave() {
     if (!form.title.trim() || !form.content.trim()) return;
-    setSaving(true);
-    await onSave(doc.id, form);
-    setSaving(false);
+    setSaving(true); await onSave(doc.id, form); setSaving(false);
   }
 
   return (
@@ -302,16 +322,25 @@ export default function App() {
   const [expandedDoc, setExpandedDoc] = useState(null);
   const [editingDoc, setEditingDoc]   = useState(null);
 
+  // Docs manual
   const [docForm, setDocForm]     = useState({ title: "", category: "Onboarding", content: "" });
   const [docSaved, setDocSaved]   = useState(false);
   const [docSaving, setDocSaving] = useState(false);
 
+  // File upload
   const [fileUploading, setFileUploading] = useState(false);
   const [fileStatus, setFileStatus]       = useState("");
   const [dragOver, setDragOver]           = useState(false);
   const fileInputRef = useRef(null);
 
-  // Superadmin — form usuarios
+  // URL ingestion
+  const [urlInput, setUrlInput]       = useState("");
+  const [urlTitle, setUrlTitle]       = useState("");
+  const [urlCategory, setUrlCategory] = useState("Onboarding");
+  const [urlLoading, setUrlLoading]   = useState(false);
+  const [urlStatus, setUrlStatus]     = useState("");
+
+  // Superadmin emails
   const [emailForm, setEmailForm]     = useState({ email: "", name: "", password: "" });
   const [emailSaved, setEmailSaved]   = useState(false);
   const [emailErr, setEmailErr]       = useState("");
@@ -392,18 +421,39 @@ export default function App() {
       setFileStatus(`✅ Guardando "${title}"...`);
       const rows = await db.addKnowledge({ title, category: "Onboarding", content: content.trim() });
       setKnowledge(prev => [...prev, rows[0]]);
-      setFileStatus(`✅ "${title}" guardado correctamente`);
+      setFileStatus(`✅ "${title}" guardado`);
       setTimeout(() => setFileStatus(""), 3000);
     } catch (e) { setFileStatus(`❌ Error: ${e.message}`); }
     setFileUploading(false);
   }
 
-  // ── Emails (superadmin) ─────────────────────────────────────────────────────
+  // ── URL ingestion ───────────────────────────────────────────────────────────
+  async function handleUrl() {
+    const url = urlInput.trim();
+    if (!url) return;
+    if (!url.startsWith("http")) { setUrlStatus("❌ Ingresa una URL válida (debe comenzar con http o https)"); return; }
+
+    setUrlLoading(true);
+    setUrlStatus(`⏳ Accediendo a ${url}...`);
+    try {
+      const content = await extractFromUrl(url);
+      const title = urlTitle.trim() || url.replace(/^https?:\/\//, "").split("/")[0];
+      setUrlStatus(`✅ Guardando "${title}"...`);
+      const rows = await db.addKnowledge({ title, category: urlCategory, content });
+      setKnowledge(prev => [...prev, rows[0]]);
+      setUrlInput(""); setUrlTitle(""); setUrlCategory("Onboarding");
+      setUrlStatus(`✅ "${title}" guardado correctamente`);
+      setTimeout(() => setUrlStatus(""), 3000);
+    } catch (e) { setUrlStatus(`❌ Error: ${e.message}`); }
+    setUrlLoading(false);
+  }
+
+  // ── Emails ──────────────────────────────────────────────────────────────────
   async function addEmail() {
     const n = norm(emailForm.email);
-    if (!isValidEmail(n))                   { setEmailErr("Correo inválido"); return; }
-    if (!emailForm.password.trim())          { setEmailErr("La contraseña es obligatoria"); return; }
-    if (emailForm.password.trim().length < 6){ setEmailErr("La contraseña debe tener al menos 6 caracteres"); return; }
+    if (!isValidEmail(n))                    { setEmailErr("Correo inválido"); return; }
+    if (!emailForm.password.trim())           { setEmailErr("La contraseña es obligatoria"); return; }
+    if (emailForm.password.trim().length < 6) { setEmailErr("Mínimo 6 caracteres"); return; }
     if (emails.find(e => norm(e.email) === n)){ setEmailErr("Este correo ya está en la lista"); return; }
     setEmailSaving(true);
     try {
@@ -423,6 +473,13 @@ export default function App() {
   const categories = ["Onboarding", "Beneficios", "Políticas", "Herramientas", "Procesos", "Cultura", "Otros"];
   const catColor = { Onboarding: "#fff", Beneficios: "#D4AF37", Políticas: "#aaa", Herramientas: "#c8a52e", Procesos: "#ddd", Cultura: "#e0c060", Otros: "#666" };
   const quickQ = ["¿Cuál es el proceso de onboarding?", "¿Qué herramientas debo usar?", "¿Cuáles son mis beneficios?", "¿Cuál es la política de vacaciones?"];
+
+  // ── Source type badge ───────────────────────────────────────────────────────
+  const getSourceIcon = (doc) => {
+    if (doc.content?.startsWith("📎 Recurso externo") || doc.content?.startsWith("📎 Recurso:")) return "🔗";
+    if (doc.title?.match(/\.(pdf|docx|xlsx|csv|pptx)/i)) return "📄";
+    return "✏️";
+  };
 
   return (
     <div style={S.page}>
@@ -501,7 +558,7 @@ export default function App() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 24 }}>
             <div>
               <h2 style={{ fontSize: 17, fontWeight: 700, color: "#fff", marginBottom: 4 }}>Base de Conocimiento TGP</h2>
-              <p style={{ color: "#444", fontSize: 13 }}>Sube archivos o escribe documentos que los SDRs podrán consultar.</p>
+              <p style={{ color: "#444", fontSize: 13 }}>Sube archivos, agrega links o escribe documentos para que los SDRs puedan consultarlos.</p>
             </div>
             <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, background: "#111", border: "1px solid #1e1e1e", borderRadius: 8, padding: "8px 14px" }}>
@@ -515,7 +572,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Subir archivo */}
+          {/* ── SUBIR ARCHIVO ── */}
           <div style={S.card}>
             <div style={{ ...S.label, marginBottom: 14 }}>📎 Subir archivo</div>
             <div
@@ -523,23 +580,61 @@ export default function App() {
               onDragLeave={() => setDragOver(false)}
               onDrop={e => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); }}
               onClick={() => !fileUploading && fileInputRef.current?.click()}
-              style={{ border: `2px dashed ${dragOver ? "#D4AF37" : "#2a2a2a"}`, borderRadius: 10, padding: "32px 20px", textAlign: "center", cursor: fileUploading ? "default" : "pointer", transition: "all .2s", background: dragOver ? "#D4AF3708" : "transparent" }}
+              style={{ border: `2px dashed ${dragOver ? "#D4AF37" : "#2a2a2a"}`, borderRadius: 10, padding: "28px 20px", textAlign: "center", cursor: fileUploading ? "default" : "pointer", transition: "all .2s", background: dragOver ? "#D4AF3708" : "transparent" }}
             >
-              <div style={{ fontSize: 28, marginBottom: 10 }}>{fileUploading ? "⏳" : "📁"}</div>
-              <div style={{ color: "#666", fontSize: 13, lineHeight: 1.6 }}>
-                {fileUploading ? "Procesando archivo..." : (<>Arrastra aquí o <span style={{ color: "#D4AF37", fontWeight: 600 }}>haz clic para subir</span></>)}
+              <div style={{ fontSize: 26, marginBottom: 8 }}>{fileUploading ? "⏳" : "📁"}</div>
+              <div style={{ color: "#666", fontSize: 13 }}>
+                {fileUploading ? "Procesando..." : (<>Arrastra aquí o <span style={{ color: "#D4AF37", fontWeight: 600 }}>haz clic para subir</span></>)}
               </div>
-              <div style={{ color: "#333", fontSize: 11, marginTop: 6 }}>PDF · Word · Excel · CSV · PowerPoint</div>
+              <div style={{ color: "#333", fontSize: 11, marginTop: 5 }}>PDF · Word · Excel · CSV · PowerPoint</div>
             </div>
             <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.txt,.pptx,.ppt" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
             {fileStatus && (
-              <div style={{ marginTop: 12, padding: "10px 14px", background: "#0a0a0a", borderRadius: 7, fontSize: 13, color: fileStatus.startsWith("❌") ? "#e53e3e" : fileStatus.startsWith("✅") ? "#34c78a" : "#D4AF37", border: "1px solid #1e1e1e" }}>
+              <div style={{ marginTop: 10, padding: "10px 14px", background: "#0a0a0a", borderRadius: 7, fontSize: 13, color: fileStatus.startsWith("❌") ? "#e53e3e" : fileStatus.startsWith("✅") ? "#34c78a" : "#D4AF37", border: "1px solid #1e1e1e" }}>
                 {fileStatus}
               </div>
             )}
           </div>
 
-          {/* Texto manual */}
+          {/* ── AGREGAR LINK ── */}
+          <div style={S.card}>
+            <div style={{ ...S.label, marginBottom: 14 }}>🔗 Agregar link</div>
+            <div style={{ color: "#444", fontSize: 12, marginBottom: 14, lineHeight: 1.6 }}>
+              Pega una URL de Google Drive, Notion, página web, etc. El agente extraerá el contenido disponible y lo guardará como referencia.
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>URL</div>
+              <input
+                value={urlInput} onChange={e => { setUrlInput(e.target.value); setUrlStatus(""); }}
+                placeholder="https://drive.google.com/... o cualquier URL"
+                style={S.inp(false)}
+              />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 190px", gap: 10, marginBottom: 12 }}>
+              <div>
+                <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Título (opcional)</div>
+                <input value={urlTitle} onChange={e => setUrlTitle(e.target.value)} placeholder="Ej: Manual de bienvenida en Drive" style={S.inp(false)} />
+              </div>
+              <div>
+                <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Categoría</div>
+                <select value={urlCategory} onChange={e => setUrlCategory(e.target.value)} style={{ ...S.inp(false), width: "auto" }}>
+                  {categories.map(c => <option key={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, alignItems: "center" }}>
+              {urlStatus && (
+                <span style={{ fontSize: 12, color: urlStatus.startsWith("❌") ? "#e53e3e" : urlStatus.startsWith("✅") ? "#34c78a" : "#D4AF37" }}>
+                  {urlStatus}
+                </span>
+              )}
+              <button onClick={handleUrl} disabled={!urlInput.trim() || urlLoading} style={S.btn(!!urlInput.trim() && !urlLoading)}>
+                {urlLoading ? "Procesando..." : "Agregar link"}
+              </button>
+            </div>
+          </div>
+
+          {/* ── TEXTO MANUAL ── */}
           <div style={S.card}>
             <div style={{ ...S.label, marginBottom: 14 }}>✏️ Escribir manualmente</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 190px", gap: 10, marginBottom: 10 }}>
@@ -559,25 +654,26 @@ export default function App() {
             </div>
           </div>
 
-          {/* Lista docs */}
-          <div style={{ ...S.label, marginBottom: 12 }}>{knowledge.length} documento{knowledge.length !== 1 ? "s" : ""}</div>
+          {/* ── LISTA DOCS ── */}
+          <div style={{ ...S.label, marginBottom: 12 }}>{knowledge.length} documento{knowledge.length !== 1 ? "s" : ""} en la base de conocimiento</div>
           {dbLoading ? <Spinner /> : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {knowledge.length === 0 && <div style={{ textAlign: "center", padding: 52, color: "#2a2a2a", background: "#111", borderRadius: 10, border: "1px dashed #1e1e1e", fontSize: 13 }}>Sin documentos. Sube un archivo o agrega uno manualmente.</div>}
+              {knowledge.length === 0 && <div style={{ textAlign: "center", padding: 52, color: "#2a2a2a", background: "#111", borderRadius: 10, border: "1px dashed #1e1e1e", fontSize: 13 }}>Sin documentos aún.</div>}
               {knowledge.map(doc => (
                 <div key={doc.id} style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: 9, overflow: "hidden" }}>
                   <div style={{ padding: "13px 16px", display: "flex", alignItems: "center", gap: 10 }}>
-                    <div style={{ cursor: "pointer", flex: 1, display: "flex", alignItems: "center", gap: 10 }} onClick={() => setExpandedDoc(expandedDoc === doc.id ? null : doc.id)}>
+                    <span style={{ fontSize: 14, flexShrink: 0 }}>{getSourceIcon(doc)}</span>
+                    <div style={{ cursor: "pointer", flex: 1, display: "flex", alignItems: "center", gap: 10, minWidth: 0 }} onClick={() => setExpandedDoc(expandedDoc === doc.id ? null : doc.id)}>
                       <span style={S.tag(catColor[doc.category]||"#888")}>{doc.category}</span>
-                      <span style={{ fontWeight: 600, fontSize: 13.5, color: "#ddd", flex: 1 }}>{doc.title}</span>
+                      <span style={{ fontWeight: 600, fontSize: 13.5, color: "#ddd", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{doc.title}</span>
                     </div>
                     <button onClick={() => setEditingDoc(doc)}
-                      style={{ background: "transparent", border: "1px solid #2a2a2a", cursor: "pointer", color: "#555", padding: "4px 10px", borderRadius: 5, fontSize: 11, fontFamily: "inherit" }}
+                      style={{ background: "transparent", border: "1px solid #2a2a2a", cursor: "pointer", color: "#555", padding: "4px 10px", borderRadius: 5, fontSize: 11, fontFamily: "inherit", flexShrink: 0 }}
                       onMouseEnter={e => { e.currentTarget.style.borderColor="#D4AF37"; e.currentTarget.style.color="#D4AF37"; }}
                       onMouseLeave={e => { e.currentTarget.style.borderColor="#2a2a2a"; e.currentTarget.style.color="#555"; }}>
                       ✏️ Editar
                     </button>
-                    <button onClick={() => deleteDoc(doc.id)} style={{ background: "transparent", border: "none", cursor: "pointer", color: "#2a2a2a", padding: 4, fontSize: 15 }}
+                    <button onClick={() => deleteDoc(doc.id)} style={{ background: "transparent", border: "none", cursor: "pointer", color: "#2a2a2a", padding: 4, fontSize: 15, flexShrink: 0 }}
                       onMouseEnter={e => e.currentTarget.style.color="#e53e3e"} onMouseLeave={e => e.currentTarget.style.color="#2a2a2a"}>✕</button>
                   </div>
                   {expandedDoc === doc.id && <div style={{ borderTop: "1px solid #1a1a1a", padding: "14px 16px", color: "#555", fontSize: 13, lineHeight: 1.75, whiteSpace: "pre-wrap", maxHeight: 300, overflowY: "auto" }}>{doc.content}</div>}
@@ -601,26 +697,19 @@ export default function App() {
                 <button onClick={logout} style={{ background: "transparent", border: "1px solid #1e1e1e", color: "#444", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: 12, fontFamily: "inherit" }}>Cerrar sesión</button>
               </div>
 
-              <div style={{ background: "#111", border: "1px solid #D4AF3718", borderRadius: 10, padding: "14px 18px", marginBottom: 24, fontSize: 13, color: "#555", lineHeight: 1.7 }}>
-                <span style={{ color: "#D4AF37", fontWeight: 700 }}>¿Cómo funciona?</span> Cada usuario tiene su correo y contraseña propia. Al entrar a <strong style={{ color: "#888" }}>⚙️ Admin</strong> deben ingresar ambos para acceder.
-              </div>
-
-              {/* Form agregar usuario */}
               <div style={S.card}>
                 <div style={{ ...S.label, marginBottom: 16 }}>+ Agregar usuario admin</div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
                   <div>
                     <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Correo</div>
-                    <input type="email" value={emailForm.email} onChange={e => { setEmailForm({ ...emailForm, email: e.target.value }); setEmailErr(""); }}
-                      placeholder="persona@tgp.com" style={S.inp(!!emailErr)} />
+                    <input type="email" value={emailForm.email} onChange={e => { setEmailForm({ ...emailForm, email: e.target.value }); setEmailErr(""); }} placeholder="persona@tgp.com" style={S.inp(!!emailErr)} />
                   </div>
                   <div>
                     <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Nombre (opcional)</div>
-                    <input value={emailForm.name} onChange={e => setEmailForm({ ...emailForm, name: e.target.value })}
-                      placeholder="Ej: María González" style={S.inp(false)} />
+                    <input value={emailForm.name} onChange={e => setEmailForm({ ...emailForm, name: e.target.value })} placeholder="Ej: María González" style={S.inp(false)} />
                   </div>
                 </div>
-                <div>
+                <div style={{ marginBottom: 12 }}>
                   <div style={{ ...S.label, fontSize: 10, marginBottom: 6 }}>Contraseña (mín. 6 caracteres)</div>
                   <div style={{ position: "relative" }}>
                     <input type={showNewPass ? "text" : "password"} value={emailForm.password}
@@ -632,8 +721,8 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                {emailErr && <div style={{ color: "#e53e3e", fontSize: 12, marginTop: 8 }}>{emailErr}</div>}
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, alignItems: "center", marginTop: 14 }}>
+                {emailErr && <div style={{ color: "#e53e3e", fontSize: 12, marginBottom: 10 }}>{emailErr}</div>}
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, alignItems: "center" }}>
                   {emailSaved && <span style={{ color: "#D4AF37", fontSize: 12, fontWeight: 600 }}>✓ Usuario agregado</span>}
                   <button onClick={addEmail} disabled={!emailForm.email.trim() || !emailForm.password.trim() || emailSaving} style={S.btn(!!emailForm.email.trim() && !!emailForm.password.trim() && !emailSaving)}>
                     {emailSaving ? "Guardando..." : "Agregar usuario"}
@@ -641,7 +730,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Lista usuarios */}
               <div style={{ ...S.label, marginBottom: 12 }}>{emails.length} usuario{emails.length !== 1 ? "s" : ""} autorizado{emails.length !== 1 ? "s" : ""}</div>
               {dbLoading ? <Spinner /> : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
